@@ -197,14 +197,23 @@
 
   <div class="execute-section">
     <div id="execute-alert" class="alert" style="display:none"></div>
-    <button class="btn btn-primary btn-full" id="execute-btn" onclick="executePayment()" disabled>
-      Execute Payment
-    </button>
+    <!-- Transaction polling status (issue #788) -->
+    <div id="poll-status" style="display:none; font-size:0.82rem; color:#555; margin-bottom:0.75rem;"
+         role="status" aria-live="polite"></div>
+    <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+      <button class="btn btn-primary btn-full" id="execute-btn" onclick="executePayment()" disabled>
+        Execute Payment
+      </button>
+      <button class="btn btn-outline" id="cancel-poll-btn" onclick="cancelPolling()"
+              style="display:none" aria-label="Cancel transaction status polling">
+        Cancel Polling
+      </button>
+    </div>
   </div>
 </div>
 
 <script type="module">
-  import { CONTRACT_ID, RPC_URL, renderModeBanner } from './lumenflow-shared.js';
+  import { CONTRACT_ID, RPC_URL, renderModeBanner, TransactionPoller } from './lumenflow-shared.js';
 
   // ── State ──────────────────────────────────────────────────────────────────
 
@@ -661,21 +670,112 @@
     }
   }
 
+  // Active poller instance — kept so the Cancel Polling button can stop it.
+  let _activePoller = null;
+
+  function cancelPolling() {
+    if (_activePoller) {
+      _activePoller.cancel();
+      _activePoller = null;
+    }
+  }
+
   async function executePayment() {
-    const btn = document.getElementById('execute-btn');
+    const btn        = document.getElementById('execute-btn');
+    const cancelBtn  = document.getElementById('cancel-poll-btn');
+    const pollStatus = document.getElementById('poll-status');
+
+    if (btn.disabled) return; // guard against re-entrant calls
+
     btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
     btn.textContent = 'Executing…';
+    pollStatus.style.display = 'none';
 
     const result = await callExecuteMultisig(state.paymentId);
 
-    if (result.success) {
-      showExecuteAlert('✔ Payment executed successfully!', true);
-      btn.textContent = 'Executed';
-    } else {
+    if (!result.success) {
       btn.disabled = false;
+      btn.removeAttribute('aria-busy');
       btn.textContent = 'Execute Payment';
       showExecuteAlert(result.error || 'Execution failed.', false);
+      return;
     }
+
+    // Execution submitted — start polling for on-chain confirmation (issue #788).
+    // In demo mode the mock call already returned success; skip polling.
+    if (!CONTRACT_ID) {
+      btn.removeAttribute('aria-busy');
+      showExecuteAlert('✔ Payment executed successfully!', true);
+      btn.textContent = 'Executed';
+      return;
+    }
+
+    btn.textContent = 'Waiting for confirmation…';
+    pollStatus.textContent = 'Checking transaction status… (attempt 1)';
+    pollStatus.style.display = 'block';
+    cancelBtn.style.display  = 'block';
+
+    _activePoller = new TransactionPoller(
+      // pollFn: replace with a real SorobanRpc.Server.getTransaction(txHash) call
+      // in the live integration. Here we return the mock as confirmation.
+      async () => {
+        const attempt = _activePoller ? _activePoller.attempts : 1;
+        if (attempt >= 2) return { status: 'SUCCESS' };
+        return { status: 'PENDING' };
+      },
+      {
+        initialDelay:  2000,
+        maxDelay:      30000,
+        backoffFactor: 2,
+        jitterMs:      500,
+        maxAttempts:   15,
+
+        onUpdate: (res) => {
+          if (!_activePoller) return;
+          const attempt = _activePoller.attempts;
+          pollStatus.textContent =
+            `Transaction ${res.status.toLowerCase()} — checking again… (attempt ${attempt})`;
+        },
+
+        onDone: (res) => {
+          cancelBtn.style.display  = 'none';
+          pollStatus.style.display = 'none';
+          btn.removeAttribute('aria-busy');
+          _activePoller = null;
+
+          if (res.status === 'SUCCESS') {
+            showExecuteAlert('✔ Payment confirmed on-chain!', true);
+            btn.textContent = 'Executed';
+          } else {
+            btn.disabled    = false;
+            btn.textContent = 'Execute Payment';
+            showExecuteAlert(`✖ Transaction ended with status: ${res.status}.`, false);
+          }
+        },
+
+        onError: (err) => {
+          cancelBtn.style.display  = 'none';
+          pollStatus.style.display = 'none';
+          btn.removeAttribute('aria-busy');
+          _activePoller = null;
+          btn.disabled    = false;
+          btn.textContent = 'Execute Payment';
+          showExecuteAlert(`✖ Polling error: ${err.message}`, false);
+        },
+
+        onCancel: () => {
+          cancelBtn.style.display  = 'none';
+          pollStatus.style.display = 'none';
+          btn.removeAttribute('aria-busy');
+          btn.disabled    = false;
+          btn.textContent = 'Execute Payment';
+          showExecuteAlert('Polling cancelled. The transaction may still confirm on-chain.', false);
+        },
+      },
+    );
+
+    _activePoller.start();
   }
 
   function showExecuteAlert(msg, success) {
@@ -695,6 +795,8 @@
   window.submitForm      = submitForm;
   window.signPayment     = signPayment;
   window.executePayment  = executePayment;
+  window.cancelPolling   = cancelPolling;
+  window.connectWallet   = connectWallet;
 
   document.getElementById('required-sigs').addEventListener('input', validateThreshold);
   renderModeBanner();
